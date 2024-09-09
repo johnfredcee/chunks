@@ -72,4 +72,5 @@ CMakeUserPresets.json
 !.vscode/extensions.json
 *.code-workspace
 
-.cahce
+build/*
+.cache
