@@ -17,6 +17,7 @@ typedef struct t_CHUNK
     struct t_CHUNK *next;  /* next sibling chunk */
 } t_CHUNK;
 
+// header size is first three fields of t_CHUNK - used when working out offsets to next chunk / subchunk
 static const long header_size = (long)(sizeof(uint32_t) * 2 + sizeof(size_t));
 
 t_CHUNK* alloc_chunk(size_t size);
@@ -54,15 +55,6 @@ t_CHUNK *chunk_end_offset(t_CHUNK *chunk)
     size_t  size = chunk->size;
     uint8_t *data = (uint8_t *)chunk;
     return (t_CHUNK *)data + size;
-}
-
-/* write the header of a chunked file to disk */
-void write_chunked_file_header(FILE* fp, uint32_t id, size_t size, uint32_t count)
-{
-    fwrite(&id, sizeof(uint32_t), 1, fp);
-    fwrite(&size, sizeof(size_t), 1, fp);
-    fwrite(&count, sizeof(uint32_t), 1, fp);
-    return;
 }
 
 
@@ -134,9 +126,6 @@ void add_chunk(t_CHUNK* chunk, t_CHUNK *next_chunk)
 }
 
 
-/* problem - this will only work for 1 subchunk - we need to account for the overall chunk size */
-/* either we change it so that chunk size includes subchunks or we calculate */
-/* we need to move writing out of "add_*" and fixup at write time */
 void add_subchunk(t_CHUNK* chunk, t_CHUNK* subchunk) 
 {
     assert(chunk != NULL);
@@ -147,41 +136,60 @@ void add_subchunk(t_CHUNK* chunk, t_CHUNK* subchunk)
     } else {
         chunk->subchunk = subchunk;
     };
+    //chunk->size += sizeof(t_CHUNK) + subchunk->size;
+    chunk->count++;
 }
 
+// returns number of chunks wtitten
 uint32_t write_chunks(FILE *fp, t_CHUNK* chunk)
 {
-    size_t result = 0;
     uint32_t  count = 0;
     do {
+        t_CHUNK write_chunk = *chunk;
+        // make a note of the start of the chunk data
         long start = ftell(fp);
-        fwrite(chunk, sizeof(t_CHUNK), 1, fp);
-        fwrite(chunk_data(chunk), chunk->size, 1, fp);
-        t_CHUNK* subchunk = chunk->subchunk;
+        // write the chunk
+        fwrite(&write_chunk, sizeof(t_CHUNK), 1, fp);
+        // write the data  of the chunk
+        fwrite(chunk_data(chunk), write_chunk.size, 1, fp);
+        // get the first subchunk
+        t_CHUNK* subchunk = write_chunk.subchunk;
         long subchunk_pos = ftell(fp);
         if (subchunk != NULL) {
-            chunk->subchunk = (t_CHUNK*) (ptrdiff_t) ftell(fp);
-            chunk->count = write_chunks(fp, subchunk);
+            write_chunk.subchunk = (t_CHUNK*) (ptrdiff_t) ftell(fp);
+            write_chunk.count = write_chunks(fp, subchunk);
         }
+        // make a note of the end, after all the subchunks
         long end = ftell(fp);        
-        chunk->size = (size_t) (end - start) - sizeof(t_CHUNK);
+        // now we have written the chunk and all subchunks we can work out actual size
+        // write_chunk.size = (size_t) (end - start) - sizeof(t_CHUNK);
+        
         t_CHUNK *next_chunk = chunk->next;
-        subchunk = chunk->subchunk;
-        // substitute offsedts foir pointers
-        chunk->next = (chunk->next != NULL) ? (t_CHUNK*) (ptrdiff_t) (end - header_size) : NULL;
-        chunk->subchunk = (chunk->subchunk != NULL) ? (t_CHUNK*) (ptrdiff_t) (subchunk_pos - header_size) : NULL;
+        // substitute offsedts for pointers - we subtract header size, because the loader will already have read past it
+        write_chunk.next = (next_chunk != NULL) ? (t_CHUNK*) (ptrdiff_t) (end - header_size) : NULL;
+        write_chunk.subchunk = (subchunk != NULL) ? (t_CHUNK*) (ptrdiff_t) (subchunk_pos - header_size) : NULL;
+        // write the fixed - up chunk
         fseek(fp, start, SEEK_SET);
-        fwrite(chunk, sizeof(t_CHUNK), 1, fp);
+        fwrite(&write_chunk, sizeof(t_CHUNK), 1, fp);
         fseek(fp, end, SEEK_SET);
         // ensure pointers are restored
-        chunk->next = next_chunk;
-        chunk->subchunk = subchunk;        
         chunk = next_chunk;
         count++;
     } while (chunk != NULL);
     return count;
 }
 
+
+/* write the header of a chunked file to disk */
+void write_chunked_file_header(FILE* fp, uint32_t id, size_t size, uint32_t count)
+{
+    fwrite(&id, sizeof(uint32_t), 1, fp);
+    fwrite(&size, sizeof(size_t), 1, fp);
+    fwrite(&count, sizeof(uint32_t), 1, fp);
+    return;
+}
+
+/* close and write size and count to head chunk */
 void close_chunked(FILE* fp, uint32_t count)
 {
     size_t size = (size_t) ( ftell(fp) - header_size );
@@ -212,17 +220,14 @@ void fixup_chunks(void *head, t_CHUNK *tofixup)
 {
     while (tofixup != NULL)
     {
-        t_CHUNK *subchunk = tofixup->subchunk;
-        subchunk = subchunk != NULL ? (t_CHUNK*) ((ptrdiff_t) subchunk + (uint8_t*) head) : NULL;
-        tofixup->subchunk = subchunk;
-        while (subchunk != NULL) {
-            fixup_chunks(head,subchunk);
-            subchunk = subchunk->next;
+        ptrdiff_t subchunk = (ptrdiff_t) tofixup->subchunk;
+        tofixup->subchunk = subchunk != 0 ? (t_CHUNK*) (subchunk + (uint8_t*) head) : NULL;
+        if (subchunk != 0) {
+            fixup_chunks(head,tofixup->subchunk);
         }    
         ptrdiff_t next = (ptrdiff_t) tofixup->next;
-        next = (next != 0) ?  ((uint8_t*) head + (ptrdiff_t)next) : 0;
-        tofixup->next = (t_CHUNK*) next;
-        tofixup = (t_CHUNK *) next;
+        tofixup->next = (next != 0) ? (t_CHUNK*)  (next + (uint8_t*) head) : NULL;
+        tofixup = tofixup->next;
     }
     return;
 }
